@@ -1,0 +1,24 @@
+# SMakefile for EditInterface
+# SAS/C 6.x for AmigaOS 3.x
+#
+# Usage: smake
+
+PROG = EditInterface
+
+CFLAGS = OPTIMIZE OPTTIME NOSTKCHK STRMERGE NOCHKABORT DATA=NEAR \
+         IDIR=INCLUDE:
+
+LFLAGS = NOICONS SMALLCODE SMALLDATA
+
+OBJS = $(PROG).o
+
+all: $(PROG)
+
+$(PROG): $(OBJS)
+	slink FROM lib:c.o $(OBJS) TO $(PROG) LIB lib:sc.lib lib:amiga.lib $(LFLAGS)
+
+$(PROG).o: $(PROG).c
+	sc $(CFLAGS) $(PROG).c
+
+clean:
+	-delete $(OBJS) $(PROG) QUIET
