@@ -24,7 +24,7 @@ EditInterface provides a user-friendly graphical interface to configure Roadshow
 
 ## Screenshots
 
-*Coming soon*
+<img width="629" height="483" alt="netifmanager" src="https://github.com/user-attachments/assets/275b1b7a-514d-47a5-a891-db799d3117b3" />
 
 ## Requirements
 
