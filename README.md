@@ -17,6 +17,8 @@ EditInterface provides a user-friendly graphical interface to configure Roadshow
 - Tabbed interface with **General** and **Advanced** settings
 - Supports all Roadshow interface parameters: device, unit, address, netmask, configure mode (Static IP / DHCP / Auto / Fast Auto), debug, IP and write request buffers, traffic capture filter, and init delay
 - Gateway, up to 3 DNS servers, and default domain name
+- Live DHCP parameter display: when DHCP is active and the connection is established, the current IP address and netmask are shown in the corresponding fields via `bsdsocket.library`
+- Warning on save when the interface is currently active
 - Input validation (numeric-only fields, IP address format filtering)
 - Bubble help on all fields
 - Accepts both interface name or full file path as argument
@@ -73,9 +75,24 @@ EditInterface reads and writes the following Roadshow configuration files:
 
 | File | Description |
 |------|-------------|
-| `DEVS:NetInterfaces/<name>` | Interface device and IP configuration |
+| `DEVS:NetInterfaces/<n>` | Interface device and IP configuration |
 | `DEVS:Internet/routes` | Default gateway route |
 | `DEVS:Internet/name_resolution` | DNS servers and domain name |
+
+## Changelog
+
+### 1.1 (09.02.2026)
+- Live DHCP parameter display via `bsdsocket.library` (IP address and netmask)
+- Warning requester when saving while the interface is active
+- Full file path support as CLI argument
+- About menu with author info and GitHub link
+- Tabbed interface (General / Advanced)
+
+### 1.0 (07.02.2026)
+- Initial release
+- Interface configuration editing (device, unit, IP, netmask, configure mode)
+- Gateway, DNS and domain editing
+- Performance, diagnostics and compatibility settings
 
 ## Author
 

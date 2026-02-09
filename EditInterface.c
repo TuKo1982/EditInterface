@@ -23,6 +23,48 @@
 #include <proto/utility.h>
 #include <libraries/gadtools.h>
 
+/* ------------------------------------------------------------------ */
+/* Minimal BSD socket declarations to avoid header conflicts          */
+/* ------------------------------------------------------------------ */
+struct sockaddr_in {
+    unsigned char  sin_len;
+    unsigned char  sin_family;
+    unsigned short sin_port;
+    struct {
+        unsigned long s_addr;
+    } sin_addr;
+    char sin_zero[8];
+};
+
+struct ifreq {
+    char ifr_name[16];
+    union {
+        struct sockaddr_in ifru_addr;
+        struct sockaddr_in ifru_broadaddr;
+        short              ifru_flags;
+    } ifr_ifru;
+};
+
+#define ifr_addr      ifr_ifru.ifru_addr
+#define ifr_flags     ifr_ifru.ifru_flags
+
+#define AF_INET       2
+#define SOCK_DGRAM    2
+
+#define SIOCGIFADDR   0xC0206921UL
+#define SIOCGIFNETMASK 0xC0206925UL
+
+/* bsdsocket.library function prototypes */
+LONG socket(LONG domain, LONG type, LONG protocol);
+LONG CloseSocket(LONG sock);
+LONG IoctlSocket(LONG sock, ULONG request, char *argp);
+char *Inet_NtoA(ULONG addr);
+
+#pragma libcall SocketBase socket 1E 21003
+#pragma libcall SocketBase CloseSocket 78 001
+#pragma libcall SocketBase IoctlSocket 72 81003
+#pragma libcall SocketBase Inet_NtoA AE 001
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +72,7 @@
 /* ------------------------------------------------------------------ */
 /* Version string                                                     */
 /* ------------------------------------------------------------------ */
-static const char VER[] = "$VER: EditInterface 1.0 (07.02.2026) Renaud Schweingruber";
+static const char VER[] = "$VER: EditInterface 1.1 (09.02.2026)";
 
 /* ------------------------------------------------------------------ */
 /* MUI support macros                                                 */
@@ -43,6 +85,7 @@ static const char VER[] = "$VER: EditInterface 1.0 (07.02.2026) Renaud Schweingr
 /* Library bases                                                      */
 /* ------------------------------------------------------------------ */
 struct Library    *MUIMasterBase = NULL;
+struct Library    *SocketBase = NULL;
 struct IntuitionBase *IntuitionBase = NULL;
 extern struct DosLibrary *DOSBase;
 
@@ -144,6 +187,7 @@ static char g_FilePath[512];
 static char g_InterfaceName[128];
 static struct InterfaceConfig g_Config;
 static struct NetworkConfig g_NetConfig;
+static BOOL g_IsLive = FALSE;
 
 static const char *ROUTES_PATH = "DEVS:Internet/routes";
 static const char *NAMERES_PATH = "DEVS:Internet/name_resolution";
@@ -519,6 +563,66 @@ static BOOL WriteConfigFile(const char *path, const struct InterfaceConfig *cfg)
         fprintf(fh, "requiresinitdelay=no\n");
 
     fclose(fh);
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Query live network parameters via bsdsocket.library                */
+/* If the interface is up and DHCP is configured, fill in the actual  */
+/* IP address, netmask, gateway and DNS from the running stack.       */
+/* ------------------------------------------------------------------ */
+static BOOL QueryLiveInterface(const char *ifname,
+                               struct InterfaceConfig *cfg)
+{
+    LONG sock;
+    struct ifreq ifr;
+    struct sockaddr_in *sin;
+
+    /* Only query if configure mode is DHCP */
+    if (cfg->configureMode != CFG_DHCP)
+        return FALSE;
+
+    /* Try to open bsdsocket.library */
+    SocketBase = OpenLibrary("bsdsocket.library", 4);
+    if (!SocketBase)
+        return FALSE;
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+    {
+        CloseLibrary(SocketBase);
+        SocketBase = NULL;
+        return FALSE;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+
+    /* Query IP address */
+    if (IoctlSocket(sock, SIOCGIFADDR, (char *)&ifr) == 0)
+    {
+        sin = (struct sockaddr_in *)&ifr.ifr_addr;
+        if (sin->sin_addr.s_addr != 0)
+        {
+            strncpy(cfg->address, Inet_NtoA(sin->sin_addr.s_addr), MAX_STR - 1);
+            g_IsLive = TRUE;
+        }
+    }
+
+    /* Query netmask */
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+
+    if (IoctlSocket(sock, SIOCGIFNETMASK, (char *)&ifr) == 0)
+    {
+        sin = (struct sockaddr_in *)&ifr.ifr_addr;
+        strncpy(cfg->netmask, Inet_NtoA(sin->sin_addr.s_addr), MAX_STR - 1);
+    }
+
+    CloseSocket(sock);
+    CloseLibrary(SocketBase);
+    SocketBase = NULL;
+
     return TRUE;
 }
 
@@ -919,6 +1023,21 @@ static void EventLoop(void)
                     break;
                 }
 
+                /* Warn if the interface is currently active */
+                if (g_IsLive)
+                {
+                    LONG answer;
+                    answer = MUI_Request(app, win, 0,
+                        (char *)"Warning",
+                        (char *)"*_Save|_Cancel",
+                        (char *)"The interface is currently active.\n"
+                                "Changes will only take effect after\n"
+                                "restarting the network stack.",
+                        NULL);
+                    if (answer == 0)
+                        break;
+                }
+
                 /* Write the files */
                 if (WriteConfigFile(g_FilePath, &g_Config) &&
                     WriteRoutesFile(ROUTES_PATH, &g_NetConfig) &&
@@ -1039,6 +1158,9 @@ int main(int argc, char **argv)
     /* Parse network-wide config files */
     ParseRoutesFile(ROUTES_PATH, &g_NetConfig);
     ParseNameResFile(NAMERES_PATH, &g_NetConfig);
+
+    /* If DHCP is active, try to get live parameters from the stack */
+    QueryLiveInterface(g_InterfaceName, &g_Config);
 
     /* Build GUI */
     if (!CreateGUI())
