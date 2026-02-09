@@ -30,7 +30,7 @@
 /* ------------------------------------------------------------------ */
 /* Version string                                                     */
 /* ------------------------------------------------------------------ */
-static const char VER[] = "$VER: EditInterface 1.2 (09.02.2026)";
+static const char VER[] = "$VER: EditInterface 1.2 (09.02.2026) by Renaud Schweingruber";
 
 /* ------------------------------------------------------------------ */
 /* MUI support macros                                                 */
@@ -527,6 +527,14 @@ static BOOL WriteConfigFile(const char *path, const struct InterfaceConfig *cfg)
 /* Query live network parameters by parsing ShowNetStatus output      */
 /* If the interface is up and DHCP is configured, fill in the actual  */
 /* IP address, gateway and DNS from the running stack.                */
+/*                                                                    */
+/* ShowNetStatus output is locale-dependent. The format is always:    */
+/*   <title line>                                                     */
+/*   <label> = <ip> (... '<ifname>' ...)                              */
+/*   <label> = <gateway>                                              */
+/*   <label> = <dns1>, <dns2>, ...                                    */
+/* We parse by looking for '=' signs and the interface name in quotes */
+/* rather than matching label text, making this locale-independent.   */
 /* ------------------------------------------------------------------ */
 static BOOL QueryLiveInterface(const char *ifname,
                                struct InterfaceConfig *cfg,
@@ -537,6 +545,8 @@ static BOOL QueryLiveInterface(const char *ifname,
     char *p, *q;
     char tmpFile[256];
     char cmd[512];
+    char ifCheck[128];
+    int lineAfterFound = 0;
     BOOL found = FALSE;
 
     /* Only query if configure mode is DHCP */
@@ -554,62 +564,58 @@ static BOOL QueryLiveInterface(const char *ifname,
     if (!fh)
         return FALSE;
 
+    /* Prepare interface name check string: 'V4Net' */
+    sprintf(ifCheck, "'%s'", ifname);
+
     while (fgets(line, sizeof(line), fh))
     {
-        p = TrimString(line);
+        char *eq;
 
-        /* "Local host address         = x.x.x.x (on interface 'name')" */
-        if (strnicmp(p, "Local host address", 18) == 0)
+        p = TrimString(line);
+        eq = strchr(p, '=');
+        if (!eq)
+            continue;
+
+        if (!found)
         {
-            char *eq = strchr(p, '=');
-            if (eq)
+            /* Look for the line containing our interface name in quotes */
+            if (strstr(p, ifCheck))
             {
+                /* Extract IP: between '=' and '(' */
                 char *ip = TrimString(eq + 1);
                 char *paren = strchr(ip, '(');
-                char ifCheck[128];
 
                 if (paren)
                 {
-                    /* Terminate IP before the parenthesis */
                     q = paren - 1;
                     while (q > ip && (*q == ' ' || *q == '\t'))
                         q--;
                     *(q + 1) = '\0';
-
-                    /* Check interface name matches */
-                    sprintf(ifCheck, "'%s'", ifname);
-                    if (strstr(paren, ifCheck))
-                    {
-                        strncpy(cfg->address, ip, MAX_STR - 1);
-                        g_IsLive = TRUE;
-                        found = TRUE;
-                    }
                 }
+
+                strncpy(cfg->address, ip, MAX_STR - 1);
+                g_IsLive = TRUE;
+                found = TRUE;
+                lineAfterFound = 0;
             }
         }
-
-        /* "Default gateway address    = x.x.x.x" */
-        else if (found && strnicmp(p, "Default gateway address", 23) == 0)
+        else
         {
-            char *eq = strchr(p, '=');
-            if (eq)
+            lineAfterFound++;
+
+            if (lineAfterFound == 1)
             {
+                /* Second '=' line after address: gateway */
                 char *gw = TrimString(eq + 1);
                 strncpy(net->gateway, gw, MAX_STR - 1);
             }
-        }
-
-        /* "Domain name system servers = x.x.x.x, y.y.y.y, z.z.z.z" */
-        else if (found && strnicmp(p, "Domain name system servers", 26) == 0)
-        {
-            char *eq = strchr(p, '=');
-            if (eq)
+            else if (lineAfterFound == 2)
             {
+                /* Third '=' line after address: DNS servers */
                 char *dns = TrimString(eq + 1);
                 char *comma;
                 int count = 0;
 
-                /* Parse comma-separated DNS servers */
                 while (*dns && count < 3)
                 {
                     comma = strchr(dns, ',');
@@ -632,6 +638,8 @@ static BOOL QueryLiveInterface(const char *ifname,
                     else
                         break;
                 }
+
+                break; /* Done parsing */
             }
         }
     }
