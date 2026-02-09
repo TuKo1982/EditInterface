@@ -524,17 +524,39 @@ static BOOL WriteConfigFile(const char *path, const struct InterfaceConfig *cfg)
 }
 
 /* ------------------------------------------------------------------ */
+/* Helper: check if a string looks like an IPv4 address (x.x.x.x)    */
+/* ------------------------------------------------------------------ */
+static BOOL IsIPv4Address(const char *s)
+{
+    int dots = 0;
+    const char *p = s;
+
+    if (!s || !*s)
+        return FALSE;
+
+    while (*p)
+    {
+        if (*p == '.')
+            dots++;
+        else if (*p < '0' || *p > '9')
+            return FALSE;
+        p++;
+    }
+
+    return (BOOL)(dots == 3);
+}
+
+/* ------------------------------------------------------------------ */
 /* Query live network parameters by parsing ShowNetStatus output      */
 /* If the interface is up and DHCP is configured, fill in the actual  */
-/* IP address, gateway and DNS from the running stack.                */
+/* IP address, netmask, gateway and DNS from the running stack.       */
 /*                                                                    */
-/* ShowNetStatus output is locale-dependent. The format is always:    */
-/*   <title line>                                                     */
-/*   <label> = <ip> (... '<ifname>' ...)                              */
-/*   <label> = <gateway>                                              */
-/*   <label> = <dns1>, <dns2>, ...                                    */
-/* We parse by looking for '=' signs and the interface name in quotes */
-/* rather than matching label text, making this locale-independent.   */
+/* Two commands are used:                                              */
+/*   ShowNetStatus          -> gateway, DNS (summary view)            */
+/*   ShowNetStatus <ifname> -> IP address, netmask (detail view)      */
+/*                                                                    */
+/* Parsing is locale-independent: we look for '=' separators and      */
+/* the interface name in quotes rather than matching label text.       */
 /* ------------------------------------------------------------------ */
 static BOOL QueryLiveInterface(const char *ifname,
                                struct InterfaceConfig *cfg,
@@ -546,26 +568,85 @@ static BOOL QueryLiveInterface(const char *ifname,
     char tmpFile[256];
     char cmd[512];
     char ifCheck[128];
-    int lineAfterFound = 0;
+    int lineAfterFound;
     BOOL found = FALSE;
 
     /* Only query if configure mode is DHCP */
     if (cfg->configureMode != CFG_DHCP)
         return FALSE;
 
-    /* Run ShowNetStatus and capture output to a temp file */
+    /* ---- Phase 1: ShowNetStatus <ifname> for IP and netmask ---- */
     strcpy(tmpFile, "T:EditInterface_sns.tmp");
+    sprintf(cmd, "ShowNetStatus %s >%s", ifname, tmpFile);
+
+    if (SystemTagList(cmd, NULL) == 0)
+    {
+        fh = fopen(tmpFile, "r");
+        if (fh)
+        {
+            BOOL gotAddress = FALSE;
+
+            while (fgets(line, sizeof(line), fh))
+            {
+                char *eq = strchr(line, '=');
+                char *val;
+
+                if (!eq)
+                    continue;
+
+                val = TrimString(eq + 1);
+
+                if (!gotAddress)
+                {
+                    /* Look for the first line where value is a bare IP */
+                    if (IsIPv4Address(val))
+                    {
+                        strncpy(cfg->address, val, MAX_STR - 1);
+                        g_IsLive = TRUE;
+                        found = TRUE;
+                        gotAddress = TRUE;
+                    }
+                }
+                else
+                {
+                    /* The very next bare IP line is the netmask */
+                    if (IsIPv4Address(val))
+                    {
+                        strncpy(cfg->netmask, val, MAX_STR - 1);
+                        break;
+                    }
+                }
+            }
+
+            fclose(fh);
+        }
+    }
+
+    if (!found)
+    {
+        DeleteFile(tmpFile);
+        return FALSE;
+    }
+
+    /* ---- Phase 2: ShowNetStatus (summary) for gateway and DNS ---- */
     sprintf(cmd, "ShowNetStatus >%s", tmpFile);
 
     if (SystemTagList(cmd, NULL) != 0)
-        return FALSE;
+    {
+        DeleteFile(tmpFile);
+        return found;
+    }
 
     fh = fopen(tmpFile, "r");
     if (!fh)
-        return FALSE;
+    {
+        DeleteFile(tmpFile);
+        return found;
+    }
 
     /* Prepare interface name check string: 'V4Net' */
     sprintf(ifCheck, "'%s'", ifname);
+    lineAfterFound = 0;
 
     while (fgets(line, sizeof(line), fh))
     {
@@ -576,71 +657,50 @@ static BOOL QueryLiveInterface(const char *ifname,
         if (!eq)
             continue;
 
-        if (!found)
+        if (lineAfterFound == 0)
         {
             /* Look for the line containing our interface name in quotes */
             if (strstr(p, ifCheck))
-            {
-                /* Extract IP: between '=' and '(' */
-                char *ip = TrimString(eq + 1);
-                char *paren = strchr(ip, '(');
-
-                if (paren)
-                {
-                    q = paren - 1;
-                    while (q > ip && (*q == ' ' || *q == '\t'))
-                        q--;
-                    *(q + 1) = '\0';
-                }
-
-                strncpy(cfg->address, ip, MAX_STR - 1);
-                g_IsLive = TRUE;
-                found = TRUE;
-                lineAfterFound = 0;
-            }
+                lineAfterFound = 1;
         }
-        else
+        else if (lineAfterFound == 1)
         {
-            lineAfterFound++;
+            /* First '=' line after address: gateway */
+            char *gw = TrimString(eq + 1);
+            strncpy(net->gateway, gw, MAX_STR - 1);
+            lineAfterFound = 2;
+        }
+        else if (lineAfterFound == 2)
+        {
+            /* Second '=' line after address: DNS servers */
+            char *dns = TrimString(eq + 1);
+            char *comma;
+            int count = 0;
 
-            if (lineAfterFound == 1)
+            while (*dns && count < 3)
             {
-                /* Second '=' line after address: gateway */
-                char *gw = TrimString(eq + 1);
-                strncpy(net->gateway, gw, MAX_STR - 1);
+                comma = strchr(dns, ',');
+                if (comma)
+                    *comma = '\0';
+
+                q = TrimString(dns);
+
+                if (count == 0)
+                    strncpy(net->dns1, q, MAX_STR - 1);
+                else if (count == 1)
+                    strncpy(net->dns2, q, MAX_STR - 1);
+                else if (count == 2)
+                    strncpy(net->dns3, q, MAX_STR - 1);
+
+                count++;
+
+                if (comma)
+                    dns = comma + 1;
+                else
+                    break;
             }
-            else if (lineAfterFound == 2)
-            {
-                /* Third '=' line after address: DNS servers */
-                char *dns = TrimString(eq + 1);
-                char *comma;
-                int count = 0;
 
-                while (*dns && count < 3)
-                {
-                    comma = strchr(dns, ',');
-                    if (comma)
-                        *comma = '\0';
-
-                    q = TrimString(dns);
-
-                    if (count == 0)
-                        strncpy(net->dns1, q, MAX_STR - 1);
-                    else if (count == 1)
-                        strncpy(net->dns2, q, MAX_STR - 1);
-                    else if (count == 2)
-                        strncpy(net->dns3, q, MAX_STR - 1);
-
-                    count++;
-
-                    if (comma)
-                        dns = comma + 1;
-                    else
-                        break;
-                }
-
-                break; /* Done parsing */
-            }
+            break; /* Done parsing */
         }
     }
 
