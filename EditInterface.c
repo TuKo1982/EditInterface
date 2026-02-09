@@ -23,48 +23,6 @@
 #include <proto/utility.h>
 #include <libraries/gadtools.h>
 
-/* ------------------------------------------------------------------ */
-/* Minimal BSD socket declarations to avoid header conflicts          */
-/* ------------------------------------------------------------------ */
-struct sockaddr_in {
-    unsigned char  sin_len;
-    unsigned char  sin_family;
-    unsigned short sin_port;
-    struct {
-        unsigned long s_addr;
-    } sin_addr;
-    char sin_zero[8];
-};
-
-struct ifreq {
-    char ifr_name[16];
-    union {
-        struct sockaddr_in ifru_addr;
-        struct sockaddr_in ifru_broadaddr;
-        short              ifru_flags;
-    } ifr_ifru;
-};
-
-#define ifr_addr      ifr_ifru.ifru_addr
-#define ifr_flags     ifr_ifru.ifru_flags
-
-#define AF_INET       2
-#define SOCK_DGRAM    2
-
-#define SIOCGIFADDR   0xC0206921UL
-#define SIOCGIFNETMASK 0xC0206925UL
-
-/* bsdsocket.library function prototypes */
-LONG socket(LONG domain, LONG type, LONG protocol);
-LONG CloseSocket(LONG sock);
-LONG IoctlSocket(LONG sock, ULONG request, char *argp);
-char *Inet_NtoA(ULONG addr);
-
-#pragma libcall SocketBase socket 1E 21003
-#pragma libcall SocketBase CloseSocket 78 001
-#pragma libcall SocketBase IoctlSocket 72 81003
-#pragma libcall SocketBase Inet_NtoA AE 001
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,7 +30,7 @@ char *Inet_NtoA(ULONG addr);
 /* ------------------------------------------------------------------ */
 /* Version string                                                     */
 /* ------------------------------------------------------------------ */
-static const char VER[] = "$VER: EditInterface 1.1 (09.02.2026)";
+static const char VER[] = "$VER: EditInterface 1.2 (09.02.2026)";
 
 /* ------------------------------------------------------------------ */
 /* MUI support macros                                                 */
@@ -85,7 +43,6 @@ static const char VER[] = "$VER: EditInterface 1.1 (09.02.2026)";
 /* Library bases                                                      */
 /* ------------------------------------------------------------------ */
 struct Library    *MUIMasterBase = NULL;
-struct Library    *SocketBase = NULL;
 struct IntuitionBase *IntuitionBase = NULL;
 extern struct DosLibrary *DOSBase;
 
@@ -567,63 +524,122 @@ static BOOL WriteConfigFile(const char *path, const struct InterfaceConfig *cfg)
 }
 
 /* ------------------------------------------------------------------ */
-/* Query live network parameters via bsdsocket.library                */
+/* Query live network parameters by parsing ShowNetStatus output      */
 /* If the interface is up and DHCP is configured, fill in the actual  */
-/* IP address, netmask, gateway and DNS from the running stack.       */
+/* IP address, gateway and DNS from the running stack.                */
 /* ------------------------------------------------------------------ */
 static BOOL QueryLiveInterface(const char *ifname,
-                               struct InterfaceConfig *cfg)
+                               struct InterfaceConfig *cfg,
+                               struct NetworkConfig *net)
 {
-    LONG sock;
-    struct ifreq ifr;
-    struct sockaddr_in *sin;
+    FILE *fh;
+    char line[512];
+    char *p, *q;
+    char tmpFile[256];
+    char cmd[512];
+    BOOL found = FALSE;
 
     /* Only query if configure mode is DHCP */
     if (cfg->configureMode != CFG_DHCP)
         return FALSE;
 
-    /* Try to open bsdsocket.library */
-    SocketBase = OpenLibrary("bsdsocket.library", 4);
-    if (!SocketBase)
+    /* Run ShowNetStatus and capture output to a temp file */
+    strcpy(tmpFile, "T:EditInterface_sns.tmp");
+    sprintf(cmd, "ShowNetStatus >%s", tmpFile);
+
+    if (SystemTagList(cmd, NULL) != 0)
         return FALSE;
 
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-    {
-        CloseLibrary(SocketBase);
-        SocketBase = NULL;
+    fh = fopen(tmpFile, "r");
+    if (!fh)
         return FALSE;
-    }
 
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
-
-    /* Query IP address */
-    if (IoctlSocket(sock, SIOCGIFADDR, (char *)&ifr) == 0)
+    while (fgets(line, sizeof(line), fh))
     {
-        sin = (struct sockaddr_in *)&ifr.ifr_addr;
-        if (sin->sin_addr.s_addr != 0)
+        p = TrimString(line);
+
+        /* "Local host address         = x.x.x.x (on interface 'name')" */
+        if (strnicmp(p, "Local host address", 18) == 0)
         {
-            strncpy(cfg->address, Inet_NtoA(sin->sin_addr.s_addr), MAX_STR - 1);
-            g_IsLive = TRUE;
+            char *eq = strchr(p, '=');
+            if (eq)
+            {
+                char *ip = TrimString(eq + 1);
+                char *paren = strchr(ip, '(');
+                char ifCheck[128];
+
+                if (paren)
+                {
+                    /* Terminate IP before the parenthesis */
+                    q = paren - 1;
+                    while (q > ip && (*q == ' ' || *q == '\t'))
+                        q--;
+                    *(q + 1) = '\0';
+
+                    /* Check interface name matches */
+                    sprintf(ifCheck, "'%s'", ifname);
+                    if (strstr(paren, ifCheck))
+                    {
+                        strncpy(cfg->address, ip, MAX_STR - 1);
+                        g_IsLive = TRUE;
+                        found = TRUE;
+                    }
+                }
+            }
+        }
+
+        /* "Default gateway address    = x.x.x.x" */
+        else if (found && strnicmp(p, "Default gateway address", 23) == 0)
+        {
+            char *eq = strchr(p, '=');
+            if (eq)
+            {
+                char *gw = TrimString(eq + 1);
+                strncpy(net->gateway, gw, MAX_STR - 1);
+            }
+        }
+
+        /* "Domain name system servers = x.x.x.x, y.y.y.y, z.z.z.z" */
+        else if (found && strnicmp(p, "Domain name system servers", 26) == 0)
+        {
+            char *eq = strchr(p, '=');
+            if (eq)
+            {
+                char *dns = TrimString(eq + 1);
+                char *comma;
+                int count = 0;
+
+                /* Parse comma-separated DNS servers */
+                while (*dns && count < 3)
+                {
+                    comma = strchr(dns, ',');
+                    if (comma)
+                        *comma = '\0';
+
+                    q = TrimString(dns);
+
+                    if (count == 0)
+                        strncpy(net->dns1, q, MAX_STR - 1);
+                    else if (count == 1)
+                        strncpy(net->dns2, q, MAX_STR - 1);
+                    else if (count == 2)
+                        strncpy(net->dns3, q, MAX_STR - 1);
+
+                    count++;
+
+                    if (comma)
+                        dns = comma + 1;
+                    else
+                        break;
+                }
+            }
         }
     }
 
-    /* Query netmask */
-    memset(&ifr, 0, sizeof(ifr));
-    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+    fclose(fh);
+    DeleteFile(tmpFile);
 
-    if (IoctlSocket(sock, SIOCGIFNETMASK, (char *)&ifr) == 0)
-    {
-        sin = (struct sockaddr_in *)&ifr.ifr_addr;
-        strncpy(cfg->netmask, Inet_NtoA(sin->sin_addr.s_addr), MAX_STR - 1);
-    }
-
-    CloseSocket(sock);
-    CloseLibrary(SocketBase);
-    SocketBase = NULL;
-
-    return TRUE;
+    return found;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1065,7 +1081,7 @@ static void EventLoop(void)
                     result = MUI_Request(app, win, 0,
                         (char *)"About EditInterface",
                         (char *)"*_OK|_GitHub",
-                        (char *)"EditInterface 1.0\n"
+                        (char *)"EditInterface 1.2\n"
                                 "\n"
                                 "Roadshow network interface editor\n"
                                 "\n"
@@ -1160,7 +1176,7 @@ int main(int argc, char **argv)
     ParseNameResFile(NAMERES_PATH, &g_NetConfig);
 
     /* If DHCP is active, try to get live parameters from the stack */
-    QueryLiveInterface(g_InterfaceName, &g_Config);
+    QueryLiveInterface(g_InterfaceName, &g_Config, &g_NetConfig);
 
     /* Build GUI */
     if (!CreateGUI())
