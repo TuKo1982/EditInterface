@@ -199,9 +199,29 @@ static BOOL ParseConfigFile(const char *path, struct InterfaceConfig *cfg)
     {
         key = TrimString(line);
 
-        /* Skip empty lines and comments */
-        if (*key == '\0' || *key == '#')
+        /* Skip empty lines */
+        if (*key == '\0')
             continue;
+
+        /* Handle commented lines: only parse #address= and #netmask= */
+        if (*key == '#')
+        {
+            char *ck = TrimString(key + 1);
+            char *ceq = strchr(ck, '=');
+
+            if (ceq)
+            {
+                *ceq = '\0';
+                ck = TrimString(ck);
+
+                if (stricmp(ck, "address") == 0 && cfg->address[0] == '\0')
+                    strncpy(cfg->address, TrimString(ceq + 1), MAX_STR - 1);
+                else if (stricmp(ck, "netmask") == 0 && cfg->netmask[0] == '\0')
+                    strncpy(cfg->netmask, TrimString(ceq + 1), MAX_STR - 1);
+            }
+
+            continue;
+        }
 
         /* Find '=' separator */
         eq = strchr(key, '=');
@@ -315,7 +335,7 @@ static BOOL WriteRoutesFile(const char *path, const struct NetworkConfig *net)
         return FALSE;
 
     fprintf(fh, "# Routes configuration\n");
-    fprintf(fh, "# Edited by EditInterface 1.0\n");
+    fprintf(fh, "# Edited by EditInterface 1.2\n");
     fprintf(fh, "\n");
 
     if (net->gateway[0] != '\0')
@@ -389,7 +409,7 @@ static BOOL WriteNameResFile(const char *path, const struct NetworkConfig *net)
         return FALSE;
 
     fprintf(fh, "# Name resolution configuration\n");
-    fprintf(fh, "# Edited by EditInterface 1.0\n");
+    fprintf(fh, "# Edited by EditInterface 1.2\n");
     fprintf(fh, "\n");
 
     if (net->dns1[0] != '\0')
@@ -427,7 +447,7 @@ static BOOL WriteConfigFile(const char *path, const struct InterfaceConfig *cfg)
 
     /* Header */
     fprintf(fh, "# Configuration for interface: %s\n", g_InterfaceName);
-    fprintf(fh, "# Edited by EditInterface 1.0\n");
+    fprintf(fh, "# Edited by EditInterface 1.2\n");
     fprintf(fh, "\n");
 
     /* Device (mandatory) */
@@ -445,12 +465,22 @@ static BOOL WriteConfigFile(const char *path, const struct InterfaceConfig *cfg)
     /* IP Configuration */
     fprintf(fh, "# IP address configuration\n");
     if (cfg->address[0] != '\0')
-        fprintf(fh, "address=%s\n", cfg->address);
+    {
+        if (cfg->configureMode == CFG_DHCP)
+            fprintf(fh, "#address=%s\n", cfg->address);
+        else
+            fprintf(fh, "address=%s\n", cfg->address);
+    }
     else
         fprintf(fh, "#address=\n");
 
     if (cfg->netmask[0] != '\0')
-        fprintf(fh, "netmask=%s\n", cfg->netmask);
+    {
+        if (cfg->configureMode == CFG_DHCP)
+            fprintf(fh, "#netmask=%s\n", cfg->netmask);
+        else
+            fprintf(fh, "netmask=%s\n", cfg->netmask);
+    }
     else
         fprintf(fh, "#netmask=\n");
 
@@ -711,6 +741,23 @@ static BOOL QueryLiveInterface(const char *ifname,
 }
 
 /* ------------------------------------------------------------------ */
+/* Enable or disable network fields based on configure mode           */
+/* In DHCP mode, address/netmask/gateway/DNS/domain are read-only     */
+/* ------------------------------------------------------------------ */
+static void UpdateNetFieldsState(ULONG mode)
+{
+    BOOL disabled = (mode == CFG_DHCP) ? TRUE : FALSE;
+
+    set(str_Address, MUIA_Disabled, disabled);
+    set(str_Netmask, MUIA_Disabled, disabled);
+    set(str_Gateway, MUIA_Disabled, disabled);
+    set(str_DNS1,    MUIA_Disabled, disabled);
+    set(str_DNS2,    MUIA_Disabled, disabled);
+    set(str_DNS3,    MUIA_Disabled, disabled);
+    set(str_Domain,  MUIA_Disabled, disabled);
+}
+
+/* ------------------------------------------------------------------ */
 /* Populate GUI fields from config structure                          */
 /* ------------------------------------------------------------------ */
 static void ConfigToGUI(const struct InterfaceConfig *cfg)
@@ -741,6 +788,9 @@ static void ConfigToGUI(const struct InterfaceConfig *cfg)
     set(str_DNS2,      MUIA_String_Contents, (ULONG)g_NetConfig.dns2);
     set(str_DNS3,      MUIA_String_Contents, (ULONG)g_NetConfig.dns3);
     set(str_Domain,    MUIA_String_Contents, (ULONG)g_NetConfig.domain);
+
+    /* Update field states based on configure mode */
+    UpdateNetFieldsState(cfg->configureMode);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1069,6 +1119,10 @@ static void SetupNotifications(void)
     /* Menu: Quit */
     DoMethod(mnu_Quit, MUIM_Notify, MUIA_Menuitem_Trigger, MUIV_EveryTime,
         (ULONG)app, 2, MUIM_Application_ReturnID, MUIV_Application_ReturnID_Quit);
+
+    /* Configure mode cycle => update field states */
+    DoMethod(cyc_Configure, MUIM_Notify, MUIA_Cycle_Active, MUIV_EveryTime,
+        (ULONG)app, 2, MUIM_Application_ReturnID, MAKE_ID('C','F','G','M'));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1090,6 +1144,14 @@ static void EventLoop(void)
         {
             case MUIV_Application_ReturnID_Quit:
                 running = FALSE;
+                break;
+
+            case MAKE_ID('C','F','G','M'):
+                {
+                    ULONG mode = 0;
+                    get(cyc_Configure, MUIA_Cycle_Active, &mode);
+                    UpdateNetFieldsState(mode);
+                }
                 break;
 
             case MAKE_ID('S','A','V','E'):
@@ -1123,23 +1185,34 @@ static void EventLoop(void)
                 }
 
                 /* Write the files */
-                if (WriteConfigFile(g_FilePath, &g_Config) &&
-                    WriteRoutesFile(ROUTES_PATH, &g_NetConfig) &&
-                    WriteNameResFile(NAMERES_PATH, &g_NetConfig))
                 {
-                    MUI_Request(app, win, 0,
-                        (char *)"EditInterface",
-                        (char *)"*_OK",
-                        (char *)"Configuration saved successfully.",
-                        NULL);
-                }
-                else
-                {
-                    MUI_Request(app, win, 0,
-                        (char *)"Error",
-                        (char *)"*_OK",
-                        (char *)"Failed to write configuration file!",
-                        NULL);
+                    BOOL ok;
+
+                    ok = WriteConfigFile(g_FilePath, &g_Config);
+
+                    /* In DHCP mode, don't overwrite network-wide files */
+                    if (ok && g_Config.configureMode != CFG_DHCP)
+                    {
+                        ok = WriteRoutesFile(ROUTES_PATH, &g_NetConfig) &&
+                             WriteNameResFile(NAMERES_PATH, &g_NetConfig);
+                    }
+
+                    if (ok)
+                    {
+                        MUI_Request(app, win, 0,
+                            (char *)"EditInterface",
+                            (char *)"*_OK",
+                            (char *)"Configuration saved successfully.",
+                            NULL);
+                    }
+                    else
+                    {
+                        MUI_Request(app, win, 0,
+                            (char *)"Error",
+                            (char *)"*_OK",
+                            (char *)"Failed to write configuration file!",
+                            NULL);
+                    }
                 }
                 break;
 
